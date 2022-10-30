@@ -4,6 +4,7 @@ from config import *
 import telebot
 from telebot.types import ReplyKeyboardMarkup
 from telebot.types import ForceReply
+import datetime
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 PRECIO_KWH_CASA=0.18
@@ -89,6 +90,26 @@ def calcularPrecioRecarga(message):
         bot.send_message(message.chat.id, msg2)
         print(datos)
 
+@bot.message_handler(commands=["tiempo"])
+def recargaTiempo(message): 
+    markup = ForceReply()
+    msg = bot.send_message(message.chat.id, "¿Cuánto tiempo vas ha recargar? (En Minutos)", reply_markup=markup)
+    bot.register_next_step_handler(msg, calculoTiempoRecarga)
+
+def calculoTiempoRecarga(message):
+    minutosRecarga=message.text
+    if not minutosRecarga.isdigit():
+        markup = ForceReply()
+        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar sólo números. ¿Cuántos minutos vas a recargar?", reply_markup=markup)
+        bot.send_message(message.chat.id, msg)
+    else:
+        horaActual = datetime.datetime.now()
+        horaFinalizacion = horaActual + datetime.timedelta(minutes=int(minutosRecarga))
+        horaFinalString = str(horaFinalizacion.hour)+":"+str(horaFinalizacion.minute)
+        print(horaActual.hour,":",horaActual.minute,sep='')
+        print(horaFinalString)
+        msg = f"Lo has enchufado a las {horaActual.hour}:{horaActual.minute}h por lo que la carga terminaría a las {horaFinalString}h"
+        bot.send_message(message.chat.id, msg)
 
 if __name__=='__main__':
     print('Iniciando EVBot')
