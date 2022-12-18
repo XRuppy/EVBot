@@ -19,6 +19,7 @@ def start(message):
 - /start o /ayuda : Te enviará este mismo mensaje.
 - /equivalencias : Te dirá las equivalencias de energía (Batería, kWh y KM).
 - /recarga: Te hará una serie de preguntas para saber cuanto te costará la recarga.
+- /tiempo: Te dará hora de desenchufar el cargador una vez enchufado e introducido los minutos de la carga.
 """)
 @bot.message_handler(commands=["equivalencias"])
 def equivalencias(message):
@@ -26,11 +27,15 @@ def equivalencias(message):
 
 - 2% >> 5km >> 1kWh
 - 10% >> 25km >> 5kWh
+- 20% >> 50km >> 10kWh
 - 25% >> 62,50km >> 12,50kWh
 - 32% >> 80km >> 16kWh
 - 40% >> 100km >> 20kWh
+- 50% >> 125km >> 25kWh
 - 60% >> 150km >> 30kWh
+- 70% >> 175km >> 35kWh
 - 80% >> 200km >> 40kWh
+- 85% >> 212,50km >> 42,50kWh
 - 100% >> 250km >> 50kWh""")
 
 @bot.message_handler(commands=["recarga"])
