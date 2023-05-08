@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from config import *
+#pip install pyTelegramBotAPI
 import telebot
 from telebot.types import ReplyKeyboardMarkup
 from telebot.types import ForceReply
@@ -20,6 +21,7 @@ def start(message):
 - /equivalencias : Te dirá las equivalencias de energía (Batería, kWh y KM).
 - /recarga: Te hará una serie de preguntas para saber cuanto te costará la recarga.
 - /tiempo: Te dará hora de desenchufar el cargador una vez enchufado e introducido los minutos de la carga.
+- /tiempoRealCarga22kWh Te dará el tiempo real aproximado de carga a una velocidad de 22kWh
 """)
 @bot.message_handler(commands=["equivalencias"])
 def equivalencias(message):
@@ -41,7 +43,7 @@ def equivalencias(message):
 @bot.message_handler(commands=["recarga"])
 def recarga(message): 
     markup = ForceReply()
-    msg = bot.send_message(message.chat.id, "¿QUÉ PORCENTAJE DE BATERÍA VAS HA RECARGAR?", reply_markup=markup)
+    msg = bot.send_message(message.chat.id, "¿QUÉ PORCENTAJE DE BATERÍA VAS A RECARGAR?", reply_markup=markup)
     bot.register_next_step_handler(msg, porcentajeBateria)
 
 def porcentajeBateria(message):
@@ -50,12 +52,12 @@ def porcentajeBateria(message):
     datos[message.chat.id]["bateriaPorRecargar"] = float(bateriaPorRecargar)
     if not bateriaPorRecargar.isnumeric():
         markup = ForceReply()
-        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar sólo un número sin decimales. ¿CUANTO PORCENTAJE DE BATERÍA VAS HA RECARGAR?", reply_markup=markup)
+        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar solo un número sin decimales. ¿CUÁNTO PORCENTAJE DE BATERÍA VAS A RECARGAR?", reply_markup=markup)
         bot.register_next_step_handler(msg, porcentajeBateria)
     else:
         markup = ReplyKeyboardMarkup(one_time_keyboard=True, input_field_placeholder="Pulsa un botón",resize_keyboard=True)
         markup.add("En Casa", "En la calle")
-        msg = bot.send_message(message.chat.id, "¿DÓNDE VAS HA RECARGAR?", reply_markup=markup)
+        msg = bot.send_message(message.chat.id, "¿DÓNDE VAS A RECARGAR?", reply_markup=markup)
         bot.register_next_step_handler(msg, dondeRecarga)
 
 def dondeRecarga(message):
@@ -66,7 +68,7 @@ def dondeRecarga(message):
         datos[message.chat.id]["lugarRecarga"] = message.text
         if datos[message.chat.id]["lugarRecarga"] == "En la calle":
             markup = ForceReply()
-            msg = bot.send_message(message.chat.id, "¿A cuantos Euros esta por kWh?", reply_markup=markup)
+            msg = bot.send_message(message.chat.id, "¿A cuántos Euros está por kWh?", reply_markup=markup)
             bot.register_next_step_handler(msg, precioKwhCalle)
         elif datos[message.chat.id]["lugarRecarga"] == "En Casa":
             calcularPrecioRecarga(message)
@@ -76,7 +78,7 @@ def precioKwhCalle(message):
     datos[message.chat.id]["precioKwhCalle"] = float(precioKwhCalle)
     if not precioKwhCalle.replace('.','',1).isdigit():
         markup = ForceReply()
-        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar sólo un número. ¿A cuantos Euros esta por kWh?", reply_markup=markup)
+        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar solo un número. ¿A cuántos Euros está por kWh?", reply_markup=markup)
         bot.register_next_step_handler(msg, precioKwhCalle)
     else:
         calcularPrecioRecarga(message)
@@ -98,14 +100,14 @@ def calcularPrecioRecarga(message):
 @bot.message_handler(commands=["tiempo"])
 def recargaTiempo(message): 
     markup = ForceReply()
-    msg = bot.send_message(message.chat.id, "¿Cuánto tiempo vas ha recargar? (En Minutos)", reply_markup=markup)
+    msg = bot.send_message(message.chat.id, "¿Cuánto tiempo vas a recargar? (En Minutos)", reply_markup=markup)
     bot.register_next_step_handler(msg, calculoTiempoRecarga)
 
 def calculoTiempoRecarga(message):
     minutosRecarga=message.text
     if not minutosRecarga.isdigit():
         markup = ForceReply()
-        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar sólo números. ¿Cuántos minutos vas a recargar?", reply_markup=markup)
+        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar solo números. ¿Cuántos minutos vas a recargar?", reply_markup=markup)
         bot.send_message(message.chat.id, msg)
     else:
         horaActual = datetime.datetime.now()
@@ -114,6 +116,34 @@ def calculoTiempoRecarga(message):
         print(horaActual.hour,":",horaActual.minute,sep='')
         print(horaFinalString)
         msg = f"Lo has enchufado a las {horaActual.hour}:{horaActual.minute}h por lo que la carga terminaría a las {horaFinalString}h"
+        bot.send_message(message.chat.id, msg)
+
+
+@bot.message_handler(commands=["tiempoRealCarga22kWh"])
+def recargaTiempoReal(message): 
+    markup = ForceReply()
+    msg = bot.send_message(message.chat.id, "¿Qué porcentaje tiene actualmente?", reply_markup=markup)
+    bot.register_next_step_handler(msg, calculoTiempoRecargaReal)
+
+def calculoTiempoRecargaReal(message):
+    porcentajeActual=message.text
+    if not porcentajeActual.isdigit():
+        markup = ForceReply()
+        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar solo números. ¿Qué porcentaje tiene actualmente?", reply_markup=markup)
+        bot.send_message(message.chat.id, msg)
+    else:
+        porcentajeCarga =100 - int(porcentajeActual)
+      # Porcentaje cargado en 93 minutos
+        porcentaje1 = 14
+        # Calculamos los minutos necesarios para llegar al porcentaje deseado
+        minutos2 = (porcentajeCarga * 93) / porcentaje1 
+        minutosRedondeados = round(minutos2)
+        horaActual = datetime.datetime.now()
+        horaFinalizacion = horaActual + datetime.timedelta(minutes=int(minutosRedondeados))
+        horaFinalString = str(horaFinalizacion.hour)+":"+str(horaFinalizacion.minute)
+        print(horaActual.hour,":",horaActual.minute,sep='')
+        print(horaFinalString)
+        msg = f"Lo has enchufado a las {horaActual.hour}:{horaActual.minute}h por lo que la carga terminaría a las {horaFinalString}h. \n\nCargará un {porcentajeCarga}% hasta llegar al 100% y se estará {minutosRedondeados} minutos aprox."
         bot.send_message(message.chat.id, msg)
 
 if __name__=='__main__':
