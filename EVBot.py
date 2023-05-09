@@ -143,7 +143,12 @@ def calculoTiempoRecargaReal(message):
         horaFinalString = str(horaFinalizacion.hour)+":"+str(horaFinalizacion.minute)
         print(horaActual.hour,":",horaActual.minute,sep='')
         print(horaFinalString)
-        msg = f"Lo has enchufado a las {horaActual.hour}:{horaActual.minute}h por lo que la carga terminaría a las {horaFinalString}h. \n\nCargará un {porcentajeCarga}% hasta llegar al 100% y se estará {minutosRedondeados} minutos aprox."
+        horas = minutosRedondeados // 60
+        minutos_restantes = minutosRedondeados % 60
+        resultado = "{:02d}:{:02d}".format(horas, minutos_restantes)
+        print(resultado)
+
+        msg = f"Lo has enchufado a las {horaActual.hour}:{horaActual.minute}h por lo que la carga terminaría a las {horaFinalString}h. \n\nCargará un {porcentajeCarga}% hasta llegar al 100% y se estará {resultado} horas aprox."
         bot.send_message(message.chat.id, msg)
 
 if __name__=='__main__':
