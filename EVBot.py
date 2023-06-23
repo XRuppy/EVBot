@@ -22,6 +22,7 @@ def start(message):
 - /recarga: Te hará una serie de preguntas para saber cuanto te costará la recarga.
 - /tiempo: Te dará hora de desenchufar el cargador una vez enchufado e introducido los minutos de la carga.
 - /tiempoRealCarga22kWh Te dará el tiempo real aproximado de carga a una velocidad de 22kWh
+- /tiempoCarga55kWh Te dará el tiempo real aproximado de carga a una velocidad de 55kWh
 """)
 @bot.message_handler(commands=["equivalencias"])
 def equivalencias(message):
@@ -112,7 +113,7 @@ def calculoTiempoRecarga(message):
     else:
         horaActual = datetime.datetime.now()
         horaFinalizacion = horaActual + datetime.timedelta(minutes=int(minutosRecarga))
-        horaFinalString = str(horaFinalizacion.hour)+":"+str(horaFinalizacion.minute)
+        horaFinalString = str(horaFinalizacion.hour).zfill(2)+":"+str(horaFinalizacion.minute).zfill(2)
         print(horaActual.hour,":",horaActual.minute,sep='')
         print(horaFinalString)
         msg = f"Lo has enchufado a las {horaActual.hour}:{horaActual.minute}h por lo que la carga terminaría a las {horaFinalString}h"
@@ -140,7 +141,7 @@ def calculoTiempoRecargaReal(message):
         minutosRedondeados = round(minutos2)
         horaActual = datetime.datetime.now()
         horaFinalizacion = horaActual + datetime.timedelta(minutes=int(minutosRedondeados))
-        horaFinalString = str(horaFinalizacion.hour)+":"+str(horaFinalizacion.minute)
+        horaFinalString = str(horaFinalizacion.hour).zfill(2)+":"+str(horaFinalizacion.minute).zfill(2)
         print(horaActual.hour,":",horaActual.minute,sep='')
         print(horaFinalString)
         horas = minutosRedondeados // 60
@@ -150,6 +151,52 @@ def calculoTiempoRecargaReal(message):
 
         msg = f"Lo has enchufado a las {horaActual.hour}:{horaActual.minute}h por lo que la carga terminaría a las {horaFinalString}h. \n\nCargará un {porcentajeCarga}% hasta llegar al 100% y se estará {resultado} horas aprox."
         bot.send_message(message.chat.id, msg)
+
+import datetime
+
+@bot.message_handler(commands=["tiempoCarga55kWh"])
+def recargaTiempoRealRapida(message): 
+    markup = ForceReply()
+    msg = bot.send_message(message.chat.id, "¿Qué porcentaje tiene actualmente?", reply_markup=markup)
+    bot.register_next_step_handler(msg, calculoTiempoRecargaRapida)
+
+def calculoTiempoRecargaRapida(message):
+    porcentajeActual = message.text
+    if not porcentajeActual.isdigit():
+        markup = ForceReply()
+        msg = bot.send_message(message.chat.id, "ERROR: Debes indicar solo números. ¿Cuántos minutos vas a recargar?", reply_markup=markup)
+        bot.send_message(message.chat.id, msg)
+    else:
+        porcentajeHasta85 = 85 - int(porcentajeActual)
+        print(porcentajeHasta85)
+        tiempoCargaHasta85 = porcentajeHasta85
+        tiempoCargaDesde85 = 15 * 2
+        print(tiempoCargaDesde85)
+        tiempoTotal = tiempoCargaHasta85 + tiempoCargaDesde85
+
+        horasTotal = tiempoTotal // 60
+        minutosTotal = tiempoTotal % 60
+
+        horaActual = datetime.datetime.now()
+        horaFinalizacionHasta85 = horaActual + datetime.timedelta(minutes=tiempoCargaHasta85)
+        horaFinalizacionDesde85 = horaFinalizacionHasta85 + datetime.timedelta(minutes=tiempoCargaDesde85)
+
+        horaFinalHasta85String = str(horaFinalizacionHasta85.hour).zfill(2) + ":" + str(horaFinalizacionHasta85.minute).zfill(2)
+        horaFinalDesde85String = str(horaFinalizacionDesde85.hour).zfill(2) + ":" + str(horaFinalizacionDesde85.minute).zfill(2)
+
+        print(horaActual.hour, ":", horaActual.minute, sep='')
+        print(horaFinalHasta85String)
+        print(horaFinalDesde85String)
+
+        if horasTotal > 0:
+            tiempoTotalString = f"{horasTotal:02d}:{minutosTotal:02d}"
+        else:
+            tiempoTotalString = f"{minutosTotal} minutos"
+
+        msg = f"Lo has enchufado a las {horaActual.hour}:{horaActual.minute}h.\n\nLa carga hasta el 85% terminaría a las {horaFinalHasta85String}h y la carga desde el 85% hasta el 100% terminaría a las {horaFinalDesde85String}h. \n\nEl tiempo total de carga sería de {tiempoTotalString}."
+        bot.send_message(message.chat.id, msg)
+
+
 
 if __name__=='__main__':
     print('Iniciando EVBot')
