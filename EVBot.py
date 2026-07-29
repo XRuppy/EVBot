@@ -232,10 +232,36 @@ def guardar_datos(app_data, password=None):
     _escribir_archivo_crudo(contenido)
 
 
-# --- Valores por defecto para la rutina real de carga nocturna en casa (01:00h-07:00h) ---
-HORA_INICIO_CARGA_DEFECTO = "01:00"
+# --- Valores por defecto para la rutina real de carga nocturna en casa (00:05h-07:00h) ---
+HORA_INICIO_CARGA_DEFECTO = "00:05"
 HORA_FIN_CARGA_DEFECTO = "07:00"
-DURACION_CARGA_DEFECTO_MIN = 360  # 6 horas, de 01:00h a 07:00h
+
+
+def _parsear_hora_hhmm(texto):
+    """Convierte 'HH:MM' en (hora, minuto) o devuelve None si el formato/valores no son válidos."""
+    partes = texto.strip().split(":")
+    if len(partes) != 2 or not partes[0].isdigit() or not partes[1].isdigit():
+        return None
+    hora, minuto = int(partes[0]), int(partes[1])
+    if not (0 <= hora <= 23 and 0 <= minuto <= 59):
+        return None
+    return hora, minuto
+
+
+def _calcular_duracion_min(hora_inicio_str, hora_fin_str):
+    """Minutos entre hora_inicio_str y hora_fin_str (HH:MM), asumiendo que fin puede caer al día siguiente."""
+    ini = _parsear_hora_hhmm(hora_inicio_str)
+    fin = _parsear_hora_hhmm(hora_fin_str)
+    if not ini or not fin:
+        return 0
+    inicio_dt = datetime.datetime(2000, 1, 1, ini[0], ini[1])
+    fin_dt = datetime.datetime(2000, 1, 1, fin[0], fin[1])
+    if fin_dt <= inicio_dt:
+        fin_dt += datetime.timedelta(days=1)
+    return int((fin_dt - inicio_dt).total_seconds() // 60)
+
+
+DURACION_CARGA_DEFECTO_MIN = _calcular_duracion_min(HORA_INICIO_CARGA_DEFECTO, HORA_FIN_CARGA_DEFECTO)
 
 
 def _capacidad_efectiva(app_data):
@@ -757,21 +783,33 @@ def recibir_odometro_casa(message):
 def recibir_nueva_hora_inicio_casa(message):
     if es_cancelacion(message):
         return
-    texto = message.text.strip()
-    partes = texto.split(":")
-    if len(partes) != 2 or not partes[0].isdigit() or not partes[1].isdigit():
-        msg = bot.send_message(message.chat.id, "🙈 Usa el formato HH:MM, por ejemplo 01:00", reply_markup=teclado_cancelar())
+    resultado = _parsear_hora_hhmm(message.text)
+    if not resultado:
+        msg = bot.send_message(message.chat.id, "🙈 Usa el formato HH:MM, por ejemplo 00:05", reply_markup=teclado_cancelar())
         bot.register_next_step_handler(msg, recibir_nueva_hora_inicio_casa)
         return
-    hora, minuto = int(partes[0]), int(partes[1])
-    if not (0 <= hora <= 23 and 0 <= minuto <= 59):
-        msg = bot.send_message(message.chat.id, "🙈 Hora no válida. Usa el formato HH:MM, por ejemplo 01:00", reply_markup=teclado_cancelar())
-        bot.register_next_step_handler(msg, recibir_nueva_hora_inicio_casa)
-        return
-    fin_dt = datetime.datetime(2000, 1, 1, hora, minuto) + datetime.timedelta(minutes=DURACION_CARGA_DEFECTO_MIN)
+    hora, minuto = resultado
     nueva = datos.setdefault(message.chat.id, {}).setdefault("nuevaCarga", {})
     nueva["horaInicio"] = f"{hora:02d}:{minuto:02d}"
-    nueva["horaFin"] = f"{fin_dt.hour:02d}:{fin_dt.minute:02d}"
+    msg = bot.send_message(
+        message.chat.id,
+        f"⏰ Ahora escribe la hora de fin de carga (formato HH:MM, actual: {nueva.get('horaFin', HORA_FIN_CARGA_DEFECTO)}):",
+        reply_markup=teclado_cancelar(),
+    )
+    bot.register_next_step_handler(msg, recibir_nueva_hora_fin_casa)
+
+
+def recibir_nueva_hora_fin_casa(message):
+    if es_cancelacion(message):
+        return
+    resultado = _parsear_hora_hhmm(message.text)
+    if not resultado:
+        msg = bot.send_message(message.chat.id, "🙈 Usa el formato HH:MM, por ejemplo 07:00", reply_markup=teclado_cancelar())
+        bot.register_next_step_handler(msg, recibir_nueva_hora_fin_casa)
+        return
+    hora, minuto = resultado
+    nueva = datos.setdefault(message.chat.id, {}).setdefault("nuevaCarga", {})
+    nueva["horaFin"] = f"{hora:02d}:{minuto:02d}"
     mostrar_confirmacion_carga_casa(message)
 
 
@@ -891,6 +929,7 @@ def _guardar_carga_confirmada(chat_id):
         settings = app_data.get("settings", {})
         fecha_hoy = datetime.datetime.now().strftime("%Y-%m-%d")
         hora_inicio = nueva.get("horaInicio", HORA_INICIO_CARGA_DEFECTO)
+        hora_fin = nueva.get("horaFin", HORA_FIN_CARGA_DEFECTO)
         entrada = {
             "id": int(datetime.datetime.now().timestamp() * 1000),
             "date": f"{fecha_hoy}T{hora_inicio}",
@@ -901,7 +940,7 @@ def _guardar_carga_confirmada(chat_id):
             "socStart": nueva.get("socStart", 0),
             "odo": nueva.get("odo", 0),
             "power": settings.get("homePower", 4.4),
-            "duration": DURACION_CARGA_DEFECTO_MIN,
+            "duration": _calcular_duracion_min(hora_inicio, hora_fin),
             "pendingFinal": True,
         }
         app_data.setdefault("logs", []).append(entrada)
@@ -1743,7 +1782,7 @@ def manejar_callback_gestion(call):
         hora_actual = datos.get(chat_id, {}).get("nuevaCarga", {}).get("horaInicio", HORA_INICIO_CARGA_DEFECTO)
         msg = bot.send_message(
             chat_id,
-            f"⏰ Escribe la nueva hora de inicio de carga (formato HH:MM, actual: {hora_actual}):",
+            f"⏰ Escribe la nueva hora de INICIO de carga (formato HH:MM, actual: {hora_actual}):",
             reply_markup=teclado_cancelar(),
         )
         bot.register_next_step_handler(msg, recibir_nueva_hora_inicio_casa)
