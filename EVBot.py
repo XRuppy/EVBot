@@ -3,7 +3,9 @@
 from config import *
 #pip install pyTelegramBotAPI
 #pip install pycryptodome
+import base64
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +16,63 @@ import telebot
 from telebot.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 import datetime
 
-from crypto_utils import CryptoJSError, decrypt_cryptojs, encrypt_cryptojs
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+
+# --- Utilidades de cifrado/descifrado 100% compatibles con CryptoJS.AES.encrypt/decrypt(texto, password),
+# tal y como lo usa el dashboard ev_manager.html (antes vivían en crypto_utils.py; se integran aquí
+# para que EVBot.py sea un único fichero autocontenido y no dependa de otro módulo externo). ---
+_SALT_PREFIX = b"Salted__"
+_KEY_LEN = 32  # AES-256
+_IV_LEN = 16
+
+
+class CryptoJSError(Exception):
+    """Se lanza cuando el texto no se puede descifrar (contraseña incorrecta o dato corrupto)."""
+
+
+def _evp_bytes_to_key(password: bytes, salt: bytes, key_len: int, iv_len: int):
+    """Replica OpenSSL EVP_BytesToKey con MD5, que es lo que usa CryptoJS por defecto."""
+    derived = b""
+    block = b""
+    while len(derived) < key_len + iv_len:
+        block = hashlib.md5(block + password + salt).digest()
+        derived += block
+    return derived[:key_len], derived[key_len:key_len + iv_len]
+
+
+def encrypt_cryptojs(plaintext: str, password: str) -> str:
+    """Cifra un texto igual que CryptoJS.AES.encrypt(plaintext, password).toString()."""
+    salt = os.urandom(8)
+    key, iv = _evp_bytes_to_key(password.encode("utf-8"), salt, _KEY_LEN, _IV_LEN)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    ciphertext = cipher.encrypt(pad(plaintext.encode("utf-8"), AES.block_size))
+    raw = _SALT_PREFIX + salt + ciphertext
+    return base64.b64encode(raw).decode("utf-8")
+
+
+def decrypt_cryptojs(ciphertext_b64: str, password: str) -> str:
+    """Descifra un texto generado por CryptoJS.AES.encrypt(). Lanza CryptoJSError si falla."""
+    try:
+        raw = base64.b64decode(ciphertext_b64, validate=True)
+    except Exception as exc:
+        raise CryptoJSError("El contenido cifrado no es válido.") from exc
+
+    if len(raw) < 16 or not raw.startswith(_SALT_PREFIX):
+        raise CryptoJSError("El contenido cifrado no tiene el formato esperado.")
+
+    salt = raw[8:16]
+    ciphertext = raw[16:]
+    key, iv = _evp_bytes_to_key(password.encode("utf-8"), salt, _KEY_LEN, _IV_LEN)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+
+    try:
+        padded = cipher.decrypt(ciphertext)
+        plaintext_bytes = unpad(padded, AES.block_size)
+        return plaintext_bytes.decode("utf-8")
+    except (ValueError, KeyError, UnicodeDecodeError) as exc:
+        raise CryptoJSError("Contraseña incorrecta.") from exc
+
 
 logging.basicConfig(
 	level=logging.INFO,
