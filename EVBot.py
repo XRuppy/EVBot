@@ -4,12 +4,12 @@ from config import *
 #pip install pyTelegramBotAPI
 #pip install pycryptodome
 import base64
-import calendar
 import copy
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -306,25 +306,21 @@ def guardar_datos(app_data, password=None):
 
 
 # =========================================================================
-# Selector de fecha/hora (calendario + ajuste de hora por botones).
+# Fecha/hora de las cargas.
 # La fecha/hora de inicio y fin de una carga NUNCA se debe asumir automáticamente como "ahora":
 # se puede anotar una carga antes de que empiece, o completar los datos que faltan mucho después
 # de que la carga haya terminado, y el momento en que se escribe en el bot no tiene por qué
 # coincidir con el momento real en que la carga empezó o terminó. Por eso se pregunta siempre de
-# forma explícita, pero con botones (calendario + spinner de hora) en vez de tener que escribirla
-# a mano, para evitar errores de formato. "Usar fecha y hora actuales" sigue siendo un atajo de
-# un solo toque para el caso normal (anotar justo en el momento).
+# forma explícita. Se escribe a mano ("ahora", "ayer 22:00", "4/8 20:30"...) porque un calendario
+# de botones obligaba a demasiados toques para algo que se anota a diario.
 # =========================================================================
 
-MESES_ES = ["", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
-            "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-
 DTPICKER_PREGUNTAS = {
-    "H_INI": "¿Cuándo empezaste a cargar (enchufaste el coche)?",
-    "H_FIN": "¿Cuándo terminó realmente la carga?",
+    "H_INI": "¿Cuándo enchufaste el coche?",
+    "H_FIN": "¿Cuándo terminó la carga?",
     "S_INI": "¿Cuándo empezaste a cargar?",
     "S_FIN": "¿Cuándo terminaste de cargar?",
-    "OBD": "¿Qué día hiciste esta lectura de batería (OBD)?",
+    "OBD": "¿Qué día hiciste la lectura OBD?",
 }
 
 # Contextos que solo necesitan un DÍA (sin hora): el registro OBD, igual que su campo
@@ -367,135 +363,198 @@ def _fecha_corta(iso):
         return texto
 
 
-def _dtpicker_estado(chat_id):
-    return datos.setdefault(chat_id, {}).setdefault("_dtpicker", {})
+# --- Introducir fecha y hora ---
+# Telegram no ofrece un selector de fecha nativo para bots: o se escribe, o se construye un
+# calendario a base de botones. El calendario obligaba a demasiados toques (mes, día, y luego
+# la hora a saltos de 5/30/60 min), así que se pide escrita. A cambio, el bot tiene que ser
+# flexible interpretando lo que se escribe, que es de lo que se encarga _parsear_fecha_hora.
+_RE_HORA = re.compile(r"^(\d{1,2})[:.h](\d{2})$")
+_RE_FECHA = re.compile(r"^(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?$")
+_RE_HACE = re.compile(r"^hace\s+(\d+)\s*(m|min|mins|minuto|minutos|h|hora|horas)$")
+
+_DIAS_RELATIVOS = {"hoy": 0, "ayer": 1, "anteayer": 2}
 
 
-def _dtpicker_teclado_calendario(year, month, ctx):
-    t = InlineKeyboardMarkup()
-    etiqueta_ahora = "🕐 Usar fecha de hoy" if ctx in CTX_SOLO_FECHA else "🕐 Usar fecha y hora actuales"
-    t.add(InlineKeyboardButton(etiqueta_ahora, callback_data=f"dtp|{ctx}|now"))
-    t.add(
-        InlineKeyboardButton("◀️", callback_data=f"dtp|{ctx}|nav|-1"),
-        InlineKeyboardButton(f"{MESES_ES[month]} {year}", callback_data=f"dtp|{ctx}|noop"),
-        InlineKeyboardButton("▶️", callback_data=f"dtp|{ctx}|nav|1"),
-    )
-    hoy = datetime.date.today()
-    for semana in calendar.monthcalendar(year, month):
-        fila = []
-        for dia in semana:
-            if dia == 0:
-                fila.append(InlineKeyboardButton(" ", callback_data=f"dtp|{ctx}|noop"))
-            else:
-                marca = " •" if (year, month, dia) == (hoy.year, hoy.month, hoy.day) else ""
-                fila.append(InlineKeyboardButton(f"{dia}{marca}", callback_data=f"dtp|{ctx}|day|{dia}"))
-        t.add(*fila)
-    t.add(_boton_inline("❌ Cancelar", f"dtp|{ctx}|cancel", ESTILO_PELIGRO))
-    return t
+def _parsear_fecha_hora(texto, solo_fecha=False, ahora=None):
+    """Interpreta una fecha/hora escrita a mano. Devuelve un datetime, o None si no la entiende.
+
+    Acepta: 'ahora', 'hace 2h', 'hace 30 min', 'hoy', 'ayer', 'anteayer', '20:30',
+    'ayer 22:00', '4/8 20:30', '04/08/2026 20:30' (y con guiones o '20.30' / '20h30').
+
+    Devolver None en vez de adivinar es deliberado: es preferible volver a preguntar que
+    guardar una fecha inventada en el histórico."""
+    ahora = (ahora or datetime.datetime.now()).replace(second=0, microsecond=0)
+    t = " ".join(_normalizar_texto(texto).lower().split())
+    if not t:
+        return None
+
+    if t in ("ahora", "ya", "ahora mismo"):
+        return ahora
+
+    m = _RE_HACE.match(t)
+    if m:
+        cantidad = int(m.group(1))
+        unidad = m.group(2)
+        delta = datetime.timedelta(hours=cantidad) if unidad.startswith("h") else datetime.timedelta(minutes=cantidad)
+        return ahora - delta
+
+    partes = t.split()
+    primero = partes[0]
+    fecha_base = None
+    resto = list(partes)
+
+    if primero in _DIAS_RELATIVOS:
+        fecha_base = (ahora - datetime.timedelta(days=_DIAS_RELATIVOS[primero])).date()
+        resto = resto[1:]
+    else:
+        m = _RE_FECHA.match(primero)
+        if m:
+            dia, mes = int(m.group(1)), int(m.group(2))
+            anio_txt = m.group(3)
+            anio = ahora.year if anio_txt is None else int(anio_txt)
+            if anio < 100:
+                anio += 2000
+            try:
+                fecha_base = datetime.date(anio, mes, dia)
+            except ValueError:
+                return None
+            # Sin año explícito y en el futuro: se está anotando algo que ya ha pasado, así que
+            # un "31/12" escrito en enero es del año anterior, no del que viene.
+            if anio_txt is None and fecha_base > ahora.date() + datetime.timedelta(days=1):
+                try:
+                    fecha_base = fecha_base.replace(year=anio - 1)
+                except ValueError:
+                    return None
+            resto = resto[1:]
+
+    hora = None
+    if resto:
+        if len(resto) > 1:
+            return None
+        m = _RE_HORA.match(resto[0])
+        if not m:
+            return None
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h > 23 or mi > 59:
+            return None
+        hora = datetime.time(h, mi)
+
+    if fecha_base is None and hora is None:
+        return None
+
+    if fecha_base is None:
+        # Solo hora: se asume hoy, salvo que quede en el futuro. Quien anota una carga a las
+        # 8:00 escribiendo "22:30" se refiere a anoche, no a esta noche.
+        candidato = datetime.datetime.combine(ahora.date(), hora)
+        if candidato > ahora + datetime.timedelta(minutes=5):
+            candidato -= datetime.timedelta(days=1)
+        return candidato
+
+    if hora is None:
+        if solo_fecha:
+            return datetime.datetime.combine(fecha_base, datetime.time(0, 0))
+        if primero in _DIAS_RELATIVOS:
+            return datetime.datetime.combine(fecha_base, ahora.time())
+        return None  # una fecha suelta no basta donde hace falta la hora
+
+    return datetime.datetime.combine(fecha_base, hora)
 
 
-def _dtpicker_teclado_hora(hour, minute, ctx):
-    t = InlineKeyboardMarkup()
-    t.add(
-        InlineKeyboardButton("−1h", callback_data=f"dtp|{ctx}|h|-1"),
-        InlineKeyboardButton(f"{hour:02d}:{minute:02d}", callback_data=f"dtp|{ctx}|noop"),
-        InlineKeyboardButton("+1h", callback_data=f"dtp|{ctx}|h|1"),
-    )
-    t.add(
-        InlineKeyboardButton("−30min", callback_data=f"dtp|{ctx}|m|-30"),
-        InlineKeyboardButton("+30min", callback_data=f"dtp|{ctx}|m|30"),
-    )
-    t.add(
-        InlineKeyboardButton("−5min", callback_data=f"dtp|{ctx}|m|-5"),
-        InlineKeyboardButton("+5min", callback_data=f"dtp|{ctx}|m|5"),
-    )
-    t.add(_boton_inline("✅ Confirmar", f"dtp|{ctx}|ok", ESTILO_EXITO))
-    t.add(InlineKeyboardButton("⬅️ Cambiar fecha", callback_data=f"dtp|{ctx}|back"))
-    t.add(_boton_inline("❌ Cancelar", f"dtp|{ctx}|cancel", ESTILO_PELIGRO))
-    return t
-
-
-def _dtpicker_texto(ctx, estado):
+def _dtpicker_texto(ctx, valor_inicial_iso=None):
     if ctx.startswith("EDITLOG_"):
         campo = ctx[len("EDITLOG_"):]
-        etiqueta_campo = {"date": "fecha/hora de INICIO", "dateEnd": "fecha/hora de FIN"}.get(campo, campo)
-        pregunta = f"Editando la {etiqueta_campo} de esta carga."
+        etiqueta_campo = {"date": "INICIO", "dateEnd": "FIN"}.get(campo, campo)
+        pregunta = f"Nueva fecha/hora de {etiqueta_campo}:"
     else:
         pregunta = DTPICKER_PREGUNTAS.get(ctx.replace("_EDIT", ""), "¿Cuándo?")
-    if estado.get("screen") == "hora":
-        return (
-            f"📅⏰ {pregunta}\n\n"
-            f"Fecha elegida: {estado['day']:02d}/{estado['month']:02d}/{estado['year']}\n"
-            "Ajusta la hora con los botones y confirma:"
-        )
+
     if ctx in CTX_SOLO_FECHA:
-        return f"📅 {pregunta}\n\nElige un día del calendario, o usa la fecha de hoy:"
-    return f"📅⏰ {pregunta}\n\nElige un día del calendario, o usa la fecha/hora actuales:"
+        texto = (
+            f"📅 {pregunta}\n\n"
+            "Escríbelo como quieras:\n"
+            "• `hoy`\n"
+            "• `ayer`\n"
+            "• `4/8`\n"
+            "• `04/08/2026`"
+        )
+    else:
+        texto = (
+            f"📅 {pregunta}\n\n"
+            "Escríbelo como quieras:\n"
+            "• `ahora`\n"
+            "• `20:30`  (de hoy)\n"
+            "• `ayer 22:00`\n"
+            "• `hace 2h`\n"
+            "• `4/8 20:30`"
+        )
+    if valor_inicial_iso:
+        actual = _formatear_fecha_solo(valor_inicial_iso) if ctx in CTX_SOLO_FECHA else _formatear_fecha_hora(valor_inicial_iso)
+        texto += f"\n\nAhora mismo tiene: *{actual}*"
+    return texto
 
 
 def iniciar_selector_fecha_hora(chat_id, ctx, valor_inicial_iso=None):
-    """Abre el selector de fecha/hora (calendario + ajuste de hora con botones) para el contexto
-    indicado (H_INI, H_FIN, S_INI, S_FIN). Por defecto parte del momento actual, salvo que se
-    indique un valor previo (p.ej. al reeditar una fecha ya elegida)."""
-    ahora = datetime.datetime.now()
-    dt = ahora
-    if valor_inicial_iso:
-        try:
-            dt = datetime.datetime.strptime(valor_inicial_iso, "%Y-%m-%dT%H:%M")
-        except ValueError:
-            dt = ahora
-    estado = _dtpicker_estado(chat_id)
-    estado.clear()
-    estado.update({"ctx": ctx, "year": dt.year, "month": dt.month, "day": dt.day,
-                   "hour": dt.hour, "minute": dt.minute, "screen": "cal"})
-    texto = _dtpicker_texto(ctx, estado)
-    teclado = _dtpicker_teclado_calendario(dt.year, dt.month, ctx)
-    msg = bot.send_message(chat_id, texto, reply_markup=teclado)
-    estado["msg_id"] = msg.message_id
+    """Pide la fecha (y hora, salvo en los contextos de CTX_SOLO_FECHA) escribiéndola."""
+    datos.setdefault(chat_id, {})["_dtctx"] = ctx
+    pista = "Ej: 4/8" if ctx in CTX_SOLO_FECHA else "Ej: ayer 22:00"
+    msg = bot.send_message(
+        chat_id,
+        _dtpicker_texto(ctx, valor_inicial_iso),
+        reply_markup=teclado_cancelar(pista),
+        parse_mode="Markdown",
+    )
+    bot.register_next_step_handler(msg, _recibir_fecha_escrita)
 
 
-def _dtpicker_refrescar(chat_id, call):
-    estado = _dtpicker_estado(chat_id)
-    ctx = estado.get("ctx", "")
-    texto = _dtpicker_texto(ctx, estado)
-    if estado.get("screen") == "hora":
-        teclado = _dtpicker_teclado_hora(estado["hour"], estado["minute"], ctx)
+def _recibir_fecha_escrita(message):
+    if es_cancelacion(message):
+        return
+    chat_id = message.chat.id
+    ctx = datos.get(chat_id, {}).get("_dtctx")
+    if not ctx:
+        mostrar_menu(chat_id, "Se ha perdido el hilo de la conversación. Empieza otra vez desde el menú.")
+        return
+
+    solo_fecha = ctx in CTX_SOLO_FECHA
+    dt = _parsear_fecha_hora(message.text, solo_fecha=solo_fecha)
+    if dt is None:
+        ejemplo = "`4/8` o `ayer`" if solo_fecha else "`ayer 22:00`, `20:30` o `hace 2h`"
+        msg = bot.send_message(
+            chat_id,
+            f"🙈 No he entendido esa fecha.\n\nPrueba con {ejemplo}.",
+            reply_markup=teclado_cancelar("Ej: 4/8" if solo_fecha else "Ej: ayer 22:00"),
+            parse_mode="Markdown",
+        )
+        bot.register_next_step_handler(msg, _recibir_fecha_escrita)
+        return
+
+    datos.get(chat_id, {}).pop("_dtctx", None)
+    if solo_fecha:
+        iso = dt.strftime("%Y-%m-%d")
+        bot.send_message(chat_id, f"✅ Fecha: {_formatear_fecha_solo(iso)}")
     else:
-        teclado = _dtpicker_teclado_calendario(estado["year"], estado["month"], ctx)
-    try:
-        bot.edit_message_text(texto, chat_id=chat_id, message_id=call.message.message_id, reply_markup=teclado)
-    except Exception:
-        pass  # p.ej. doble clic sobre el mismo botón: el contenido no cambia, no es un error real
+        iso = dt.strftime("%Y-%m-%dT%H:%M")
+        bot.send_message(chat_id, f"✅ Fecha y hora: {_formatear_fecha_hora(iso)}")
+    _confirmar_seleccion_fecha(chat_id, message, ctx, iso)
 
 
-def _confirmar_seleccion_fecha(chat_id, call, ctx, estado):
-    if ctx in CTX_SOLO_FECHA:
-        iso = f"{estado['year']:04d}-{estado['month']:02d}-{estado['day']:02d}"
-        etiqueta = _formatear_fecha_solo(iso)
-        texto_ok = f"✅ Fecha elegida: {etiqueta}"
-    else:
-        iso = f"{estado['year']:04d}-{estado['month']:02d}-{estado['day']:02d}T{estado['hour']:02d}:{estado['minute']:02d}"
-        etiqueta = _formatear_fecha_hora(iso)
-        texto_ok = f"✅ Fecha/hora elegida: {etiqueta}"
-    datos.get(chat_id, {}).pop("_dtpicker", None)
-    try:
-        bot.edit_message_text(texto_ok, chat_id=chat_id, message_id=call.message.message_id)
-    except Exception:
-        pass
-
+def _confirmar_seleccion_fecha(chat_id, message, ctx, iso):
+    """Guarda la fecha ya interpretada en el sitio que corresponda y sigue con el flujo que la
+    había pedido. `message` es el mensaje del usuario, que las pantallas siguientes usan solo
+    para sacar el chat_id."""
     if ctx == "H_INI":
         nueva = datos.setdefault(chat_id, {}).setdefault("nuevaCarga", {})
         nueva["fechaInicio"] = iso
         msg = bot.send_message(
             chat_id,
             "🔋 ¿Con qué % de batería has enchufado el coche?\n\nEjemplo: 35",
-            reply_markup=teclado_cancelar(),
+            reply_markup=teclado_cancelar("Solo el número, ej: 35"),
         )
         bot.register_next_step_handler(msg, recibir_percent_inicial_casa)
     elif ctx == "H_INI_EDIT":
         nueva = datos.setdefault(chat_id, {}).setdefault("nuevaCarga", {})
         nueva["fechaInicio"] = iso
-        mostrar_confirmacion_carga_casa(call.message)
+        mostrar_confirmacion_carga_casa(message)
     elif ctx == "S_INI":
         nueva = datos.setdefault(chat_id, {}).setdefault("nuevaCarga", {})
         nueva["fechaInicio"] = iso
@@ -504,93 +563,25 @@ def _confirmar_seleccion_fecha(chat_id, call, ctx, estado):
     elif ctx == "S_INI_EDIT":
         nueva = datos.setdefault(chat_id, {}).setdefault("nuevaCarga", {})
         nueva["fechaInicio"] = iso
-        mostrar_confirmacion_carga(call.message)
+        mostrar_confirmacion_carga(message)
     elif ctx == "S_FIN":
         nueva = datos.setdefault(chat_id, {}).setdefault("nuevaCarga", {})
         nueva["fechaFin"] = iso
-        mostrar_menu_avanzado_street(call.message)
+        mostrar_menu_avanzado_street(message)
     elif ctx == "S_FIN_EDIT":
         nueva = datos.setdefault(chat_id, {}).setdefault("nuevaCarga", {})
         nueva["fechaFin"] = iso
-        mostrar_confirmacion_carga(call.message)
+        mostrar_confirmacion_carga(message)
     elif ctx == "H_FIN":
         _completar_carga_pendiente(chat_id, iso)
     elif ctx == "OBD":
         nuevo = datos.setdefault(chat_id, {}).setdefault("nuevoObd", {})
         nuevo["fecha"] = iso
-        preguntar_soh_obd(call.message)
+        preguntar_soh_obd(message)
     elif ctx.startswith("EDITLOG_"):
         key = ctx[len("EDITLOG_"):]
         datos.setdefault(chat_id, {}).setdefault("editLog", {}).setdefault("overrides", {})[key] = iso
         mostrar_menu_editar_log(chat_id)
-
-
-def _manejar_callback_selector_fecha(call):
-    chat_id = call.message.chat.id
-    partes = call.data.split("|")
-    _, ctx, accion, *resto = partes
-    estado = _dtpicker_estado(chat_id)
-    if estado.get("ctx") != ctx:
-        estado["ctx"] = ctx
-
-    if accion == "cancel":
-        datos.pop(chat_id, None)
-        try:
-            bot.edit_message_text("❌ Cancelado.", chat_id=chat_id, message_id=call.message.message_id)
-        except Exception:
-            pass
-        mostrar_menu(chat_id, "Vale, lo dejamos aquí. 😊")
-        return
-
-    if accion == "noop":
-        return
-
-    if accion == "nav":
-        delta = int(resto[0])
-        year, month = estado["year"], estado["month"]
-        month += delta
-        if month == 0:
-            month, year = 12, year - 1
-        elif month == 13:
-            month, year = 1, year + 1
-        dias_mes = calendar.monthrange(year, month)[1]
-        estado["year"], estado["month"] = year, month
-        estado["day"] = min(estado["day"], dias_mes)
-        _dtpicker_refrescar(chat_id, call)
-        return
-
-    if accion == "day":
-        estado["day"] = int(resto[0])
-        if ctx in CTX_SOLO_FECHA:
-            _confirmar_seleccion_fecha(chat_id, call, ctx, estado)
-        else:
-            estado["screen"] = "hora"
-            _dtpicker_refrescar(chat_id, call)
-        return
-
-    if accion == "back":
-        estado["screen"] = "cal"
-        _dtpicker_refrescar(chat_id, call)
-        return
-
-    if accion in ("h", "m"):
-        delta = int(resto[0])
-        dt = datetime.datetime(estado["year"], estado["month"], estado["day"], estado["hour"], estado["minute"])
-        dt += datetime.timedelta(hours=delta) if accion == "h" else datetime.timedelta(minutes=delta)
-        estado.update({"year": dt.year, "month": dt.month, "day": dt.day, "hour": dt.hour, "minute": dt.minute})
-        _dtpicker_refrescar(chat_id, call)
-        return
-
-    if accion == "now":
-        ahora = datetime.datetime.now()
-        estado.update({"year": ahora.year, "month": ahora.month, "day": ahora.day,
-                       "hour": ahora.hour, "minute": ahora.minute})
-        _confirmar_seleccion_fecha(chat_id, call, ctx, estado)
-        return
-
-    if accion == "ok":
-        _confirmar_seleccion_fecha(chat_id, call, ctx, estado)
-        return
 
 
 def _capacidad_efectiva(app_data):
@@ -618,8 +609,28 @@ def _tarifa_para_hora(app_data, hora_str):
     return settings.get("pDay", 0.22) or 0.22
 
 
-_precio_gasoil_cache = {}  # clave: id de provincia o "NACIONAL" -> {"valor":.., "ts":.., "fuente":..}
+_precio_carburante_cache = {}  # (tipo, id provincia o "NACIONAL") -> {"valor":.., "ts":.., "fuente":..}
 PRECIO_GASOIL_CACHE_HORAS = 6
+
+# Carburante del coche de referencia con el que se compara el ahorro. El campo de la API oficial
+# tiene que escribirse EXACTAMENTE así (se comprobó contra la respuesta real del ministerio).
+CARBURANTES = {
+    "gasolina95": ("Gasolina 95", "Precio Gasolina 95 E5"),
+    "gasoleo": ("Gasóleo A", "Precio Gasoleo A"),
+}
+CARBURANTE_POR_DEFECTO = "gasolina95"
+
+
+def _tipo_carburante(settings):
+    """Clave del carburante de referencia configurado, con respaldo al de por defecto si el
+    archivo trae un valor raro (o viene de una versión anterior, que no tenía este campo)."""
+    tipo = (settings or {}).get("iceFuel") or CARBURANTE_POR_DEFECTO
+    return tipo if tipo in CARBURANTES else CARBURANTE_POR_DEFECTO
+
+
+def _nombre_carburante(settings):
+    return CARBURANTES[_tipo_carburante(settings)][0]
+
 
 _provincias_cache = {"lista": None, "ts": None}
 PROVINCIAS_CACHE_HORAS = 24 * 7  # el listado de provincias españolas no cambia casi nunca
@@ -669,16 +680,18 @@ def _obtener_id_provincia(nombre_provincia):
     return None
 
 
-def _obtener_precio_gasoil_actual(provincia=None):
-    """Consulta el precio medio actual del Gasóleo A en España (API abierta oficial del Gobierno,
-    Ministerio para la Transición Ecológica) para no depender de que el usuario lo busque a mano.
-    Si se indica `provincia` (nombre) y se reconoce, calcula la media solo de esa provincia; si no,
-    usa la media nacional. Devuelve (precio, es_nuevo, descripcion_fuente) o (None, False, None) si
-    nunca se pudo obtener. Cachea unas horas para no descargar el listado en cada consulta."""
+def _obtener_precio_carburante(provincia=None, tipo=None):
+    """Consulta el precio medio actual del carburante indicado en España (API abierta oficial del
+    Gobierno, Ministerio para la Transición Ecológica) para no depender de que el usuario lo busque
+    a mano. Si se indica `provincia` (nombre) y se reconoce, calcula la media solo de esa provincia;
+    si no, usa la media nacional. Devuelve (precio, es_nuevo, descripcion_fuente) o (None, False,
+    None) si nunca se pudo obtener. Cachea unas horas para no descargar el listado en cada consulta."""
+    tipo = tipo if tipo in CARBURANTES else CARBURANTE_POR_DEFECTO
+    nombre_carburante, campo_api = CARBURANTES[tipo]
     id_provincia = _obtener_id_provincia(provincia) if provincia else None
-    clave_cache = id_provincia or "NACIONAL"
+    clave_cache = (tipo, id_provincia or "NACIONAL")
     ahora = datetime.datetime.now()
-    cache = _precio_gasoil_cache.setdefault(clave_cache, {"valor": None, "ts": None, "fuente": None})
+    cache = _precio_carburante_cache.setdefault(clave_cache, {"valor": None, "ts": None, "fuente": None})
     if cache["valor"] is not None and cache["ts"] and (ahora - cache["ts"]).total_seconds() < PRECIO_GASOIL_CACHE_HORAS * 3600:
         return cache["valor"], False, cache["fuente"]
     url = "https://sedeaplicaciones.minetur.gob.es/ServiciosRESTCarburantes/PreciosCarburantes/EstacionesTerrestres/"
@@ -690,7 +703,7 @@ def _obtener_precio_gasoil_actual(provincia=None):
         datos_api = resp.json()
         precios = []
         for estacion in datos_api.get("ListaEESSPrecio", []):
-            valor_txt = (estacion.get("Precio Gasoleo A") or "").strip()
+            valor_txt = (estacion.get(campo_api) or "").strip()
             if not valor_txt:
                 continue
             try:
@@ -703,17 +716,31 @@ def _obtener_precio_gasoil_actual(provincia=None):
         # Descripción corta a propósito: se muestra dentro de mensajes que se leen en el móvil,
         # donde "media de N gasolineras en tu provincia (X)" ocupaba dos líneas él solo.
         fuente = (
-            f"media de {len(precios)} gasolineras, {provincia}"
+            f"{nombre_carburante}, media de {len(precios)} gasolineras, {provincia}"
             if id_provincia else
-            f"media de {len(precios)} gasolineras"
+            f"{nombre_carburante}, media de {len(precios)} gasolineras"
         )
         cache["valor"] = media
         cache["ts"] = ahora
         cache["fuente"] = fuente
         return media, True, fuente
     except Exception:
-        logger.exception("No se pudo obtener el precio del gasóleo A actual (se usará el último conocido o el configurado)")
+        logger.exception("No se pudo obtener el precio actual de %s (se usará el último conocido o el configurado)", nombre_carburante)
         return cache["valor"], False, cache["fuente"]
+
+
+def _precio_carburante_efectivo(settings):
+    """Precio por litro que hay que usar en los cálculos: el de la API si el usuario lo tiene en
+    automático (por defecto) y se ha podido consultar; si no, el que tenga guardado a mano.
+    Devuelve (precio, texto_de_la_fuente)."""
+    settings = settings or {}
+    guardado = settings.get("icePrice", 0) or 0
+    if settings.get("icePriceAuto") is False:
+        return guardado, "puesto a mano"
+    precio, _, fuente = _obtener_precio_carburante(settings.get("provincia"), _tipo_carburante(settings))
+    if precio is None:
+        return guardado, "último valor guardado (no he podido consultar el precio)"
+    return precio, fuente
 
 
 _geocode_ciudad_cache = {}  # nombre normalizado -> (lat, lon)
@@ -1022,11 +1049,12 @@ def start(message):
         "\n"
         "*⚙️ MÁS OPCIONES*\n"
         "Resumen y ahorro, estadísticas,\n"
-        "tarifas, precio del gasóleo y copias\n"
+        "tarifas, precio del carburante y copias\n"
         "de seguridad.\n"
         "\n"
-        "💡 Las fechas se eligen con calendario,\n"
-        "nunca se dan por supuestas."
+        "💡 Las fechas se escriben:\n"
+        "`ahora`, `20:30`, `ayer 22:00`,\n"
+        "`hace 2h` o `4/8 20:30`."
     )
     bot.send_message(message.chat.id, texto, reply_markup=teclado_menu(), parse_mode="Markdown")
 
@@ -1278,6 +1306,60 @@ def _set_password_sesion(chat_id, password):
     estado = datos.setdefault(chat_id, {})
     estado["password"] = password
     estado["_ts"] = datetime.datetime.now()
+    _recordar_password(chat_id, password)
+
+
+# --- Contraseña recordada entre acciones ---
+# La sesión (datos[chat_id]) se borra al terminar cada flujo, así que sin esto el bot volvía a
+# pedir la contraseña en CADA acción, aunque acabases de escribirla hace diez segundos. Aquí se
+# guarda aparte, con su propia caducidad, y se renueva con cada uso: si sigues usando el bot no
+# te la vuelve a pedir, y si lo dejas se olvida sola.
+PASSWORD_TTL_MINUTOS = 30
+_passwords_recordadas = {}  # chat_id -> {"password": str, "ts": datetime}
+
+
+def _recordar_password(chat_id, password):
+    _passwords_recordadas[chat_id] = {"password": password, "ts": datetime.datetime.now()}
+
+
+def _password_recordada(chat_id):
+    """Devuelve la contraseña que este usuario escribió hace poco (renovando su caducidad),
+    la fija en config.py si la hay, o None. NO comprueba que siga siendo válida: para eso
+    está _password_lista()."""
+    if EV_BACKUP_PASSWORD:
+        return EV_BACKUP_PASSWORD
+    info = _passwords_recordadas.get(chat_id)
+    if not info:
+        return None
+    if (datetime.datetime.now() - info["ts"]).total_seconds() > PASSWORD_TTL_MINUTOS * 60:
+        _passwords_recordadas.pop(chat_id, None)
+        return None
+    info["ts"] = datetime.datetime.now()
+    return info["password"]
+
+
+def _olvidar_password(chat_id):
+    _passwords_recordadas.pop(chat_id, None)
+
+
+def _password_lista(chat_id):
+    """Devuelve una contraseña recordada YA COMPROBADA contra el archivo actual, o None si no
+    hay ninguna o la que había ya no sirve (p.ej. se cambió la contraseña desde el dashboard).
+    Comprobarla aquí evita que el usuario rellene un asistente entero para que falle al guardar.
+    Un fallo aquí no cuenta como intento fallido: no lo ha escrito él."""
+    password = _password_recordada(chat_id)
+    if password is None:
+        return None
+    try:
+        cargar_datos(password)
+    except CryptoJSError:
+        _olvidar_password(chat_id)
+        logger.info("La contraseña recordada de chat_id=%s ya no es válida; se pedirá de nuevo", chat_id)
+        return None
+    except Exception:
+        logger.exception("Error comprobando la contraseña recordada")
+        return None
+    return password
 
 
 def _purgar_sesiones_caducadas():
@@ -1288,6 +1370,13 @@ def _purgar_sesiones_caducadas():
         if ts and ts < limite:
             datos.pop(chat_id, None)
             logger.info("Sesión de chat_id=%s purgada por inactividad (más de %s min)", chat_id, SESSION_TTL_MINUTOS)
+    limite_pwd = datetime.datetime.now() - datetime.timedelta(minutes=PASSWORD_TTL_MINUTOS)
+    for chat_id in list(_passwords_recordadas.keys()):
+        info = _passwords_recordadas.get(chat_id) or {}
+        if info.get("ts") and info["ts"] < limite_pwd:
+            _passwords_recordadas.pop(chat_id, None)
+            logger.info("Contraseña recordada de chat_id=%s olvidada por inactividad", chat_id)
+
 
 
 def _iniciar_purgador_sesiones():
@@ -1345,8 +1434,9 @@ def anotar_carga_inicio(message):
         mostrar_menu(chat_id, f"🚫 Demasiados intentos fallidos. Espera {_minutos_restantes_bloqueo(chat_id)} min. antes de volver a intentarlo.")
         return
     datos[chat_id] = {"nuevaCarga": {}}
-    if EV_BACKUP_PASSWORD:
-        _set_password_sesion(chat_id, EV_BACKUP_PASSWORD)
+    recordada = _password_lista(chat_id)
+    if recordada:
+        _set_password_sesion(chat_id, recordada)
         preguntar_lugar_carga(message)
     else:
         msg = bot.send_message(
@@ -1354,7 +1444,7 @@ def anotar_carga_inicio(message):
             "🔑 Para guardar la carga en el dashboard necesito la contraseña del archivo cifrado.\n\n"
             "Si es la primera vez, escribe la contraseña que quieras usar (la necesitarás también en el dashboard web).\n\n"
             "⚠️ Intentaré borrar tu mensaje después de leerlo por seguridad.",
-            reply_markup=teclado_cancelar(),
+            reply_markup=teclado_cancelar("Contraseña del dashboard"),
         )
         bot.register_next_step_handler(msg, recibir_password_anotar)
 
@@ -1916,9 +2006,10 @@ def finalizar_carga_inicio(message):
         mostrar_menu(chat_id, f"🚫 Demasiados intentos fallidos. Espera {_minutos_restantes_bloqueo(chat_id)} min. antes de volver a intentarlo.")
         return
     datos[chat_id] = {}
-    if EV_BACKUP_PASSWORD:
-        _set_password_sesion(chat_id, EV_BACKUP_PASSWORD)
-        _iniciar_finalizar_carga(message, EV_BACKUP_PASSWORD)
+    recordada = _password_lista(chat_id)
+    if recordada:
+        _set_password_sesion(chat_id, recordada)
+        _iniciar_finalizar_carga(message, recordada)
     else:
         msg = bot.send_message(chat_id, "🔑 Escribe la contraseña del dashboard para completar la carga de anoche.", reply_markup=teclado_cancelar("Contraseña del dashboard"))
         bot.register_next_step_handler(msg, recibir_password_finalizar)
@@ -2074,8 +2165,9 @@ def ver_cargas_inicio(message):
         mostrar_menu(chat_id, f"🚫 Demasiados intentos fallidos. Espera {_minutos_restantes_bloqueo(chat_id)} min. antes de volver a intentarlo.")
         return
     datos[chat_id] = {}
-    if EV_BACKUP_PASSWORD:
-        mostrar_ultimas_cargas(message, EV_BACKUP_PASSWORD)
+    recordada = _password_lista(chat_id)
+    if recordada:
+        mostrar_ultimas_cargas(message, recordada)
     else:
         msg = bot.send_message(chat_id, "🔑 Escribe la contraseña del dashboard para ver las últimas cargas.", reply_markup=teclado_cancelar("Contraseña del dashboard"))
         bot.register_next_step_handler(msg, recibir_password_ver)
@@ -2145,11 +2237,16 @@ def _requiere_password(message, siguiente_callback):
         _set_password_sesion(chat_id, EV_BACKUP_PASSWORD)
         siguiente_callback(message, EV_BACKUP_PASSWORD)
     else:
+        recordada = _password_lista(chat_id)
+        if recordada:
+            _set_password_sesion(chat_id, recordada)
+            siguiente_callback(message, recordada)
+            return
         datos.setdefault(chat_id, {})["_next_password_cb"] = siguiente_callback
         msg = bot.send_message(
             chat_id,
             "🔑 Escribe la contraseña del archivo del dashboard.\n\n⚠️ Borraré tu mensaje después de leerlo.",
-            reply_markup=teclado_cancelar(),
+            reply_markup=teclado_cancelar("Contraseña del dashboard"),
         )
         bot.register_next_step_handler(msg, _recibir_password_generico)
 
@@ -2421,36 +2518,84 @@ def mostrar_menu_gestion(message, password):
 # "Más opciones": resumen de ahorro, configuración, tarifas, exportar/importar
 # =========================================================================
 
-# Cada campo: clave -> (etiqueta corta, tipo "num"/"text", unidad).
+# Cada campo: clave -> (etiqueta corta, tipo "num"/"text"/"choice", unidad).
 # La etiqueta va corta y la unidad separada porque en la pantalla de configuración el valor
 # actual se pinta DENTRO del propio botón ("🔋 Capacidad: 50 kWh"); con etiquetas largas
 # Telegram recortaría el texto en el móvil y no se vería el valor, que es lo importante.
+#
+# Ojo con priceEV / priceICE: son los precios de COMPRA de los dos coches (lo que costó el
+# eléctrico y lo que habría costado el de combustión equivalente), no precios de energía. Se
+# usan solo para calcular cuánto falta para amortizar el sobreprecio. Antes se llamaban
+# "Precio eléctrico" y "Precio gasolina" y se confundían con el precio del kWh y del litro.
 CONFIG_CAMPOS = {
     "model": ("🚘 Modelo", "text", ""),
     "capacity": ("🔋 Capacidad", "num", " kWh"),
     "wltp": ("🛣️ Autonomía WLTP", "num", " km"),
-    "priceEV": ("💰 Precio eléctrico", "num", " €"),
-    "priceICE": ("⛽ Precio gasolina", "num", " €"),
     "efficiency": ("⚡ Eficiencia", "num", " %"),
+    "homePower": ("🔌 Cargador de casa", "num", " kW"),
     "pDay": ("☀️ kWh de día", "num", " €"),
     "pNight": ("🌙 kWh de noche", "num", " €"),
-    "iceLiters": ("⛽ Consumo", "num", " L/100km"),
-    "icePrice": ("💶 Litro gasolina", "num", " €"),
-    "homePower": ("🔌 Cargador de casa", "num", " kW"),
+    "iceModel": ("🚗 Coche referencia", "text", ""),
+    "iceFuel": ("⛽ Combustible", "choice", ""),
+    "iceLiters": ("💨 Consumo referencia", "num", " L/100km"),
+    "icePrice": ("💶 Precio del litro", "num", " €"),
+    "priceEV": ("💰 Compra eléctrico", "num", " €"),
+    "priceICE": ("💰 Compra referencia", "num", " €"),
     "city": ("📍 Ciudad", "text", ""),
     "provincia": ("🗺️ Provincia", "text", ""),
 }
 
+# Campos de tipo "choice": valor guardado -> texto que ve el usuario.
+CONFIG_OPCIONES = {
+    "iceFuel": {clave: nombre for clave, (nombre, _campo) in CARBURANTES.items()},
+}
 
-def teclado_mas_opciones():
+# Fichas de coches para no tener que escribir capacidad, WLTP y demás a mano. No hay ninguna API
+# pública gratuita seria con capacidad útil de batería y WLTP europeo (las que existen, tipo vPIC,
+# son del mercado de EE.UU. y no traen ni una cosa ni la otra), así que la alternativa honesta es
+# una tabla corta y revisable aquí, con la fuente anotada, en vez de inventar datos.
+MODELOS_CONOCIDOS = {
+    "mokka-e": {
+        "nombre": "Opel Mokka-e (2021)",
+        "settings": {
+            "model": "Opel Mokka-e",
+            "capacity": 46,
+            "wltp": 332,
+            "iceModel": "Opel Mokka 1.2 Turbo 130",
+            "iceFuel": "gasolina95",
+            "iceLiters": 6.2,
+        },
+        "nota": (
+            "🔋 50 kWh brutos / 46 útiles y 332 km WLTP.\n\n"
+            "⚠️ El consumo de 6,2 L/100km del Mokka gasolina es una ESTIMACIÓN: no he "
+            "encontrado una ficha oficial que lo confirme. Míralo en la ficha técnica y "
+            "corrígelo aquí mismo si no cuadra: de ese número dependen todos tus ahorros."
+        ),
+    },
+}
+
+
+def teclado_modelos():
+    t = InlineKeyboardMarkup()
+    for clave, ficha in MODELOS_CONOCIDOS.items():
+        t.add(InlineKeyboardButton(f"🚘 {ficha['nombre']}", callback_data=f"mdl|{clave}"))
+    t.add(InlineKeyboardButton("⬅️ Volver", callback_data="mo_config"))
+    return t
+
+
+def teclado_mas_opciones(chat_id=None):
     t = InlineKeyboardMarkup()
     t.add(InlineKeyboardButton("📈 Resumen y ahorro", callback_data="mo_resumen"))
     t.add(InlineKeyboardButton("📊 Estadísticas", callback_data="mo_stats"))
     t.add(InlineKeyboardButton("⚙️ Configuración", callback_data="mo_config"))
     t.add(InlineKeyboardButton("🏷️ Tarifa Iberdrola", callback_data="mo_preset_iberdrola"))
-    t.add(InlineKeyboardButton("⛽ Actualizar gasóleo", callback_data="mo_gasoil"))
+    t.add(InlineKeyboardButton("⛽ Actualizar precio del litro", callback_data="mo_gasoil"))
     t.add(InlineKeyboardButton("📤 Exportar backup", callback_data="mo_exportar"))
     t.add(InlineKeyboardButton("📥 Cómo importar", callback_data="mo_importar_info"))
+    # Solo tiene sentido si hay algo que olvidar: con EV_BACKUP_PASSWORD fija en config.py el bot
+    # nunca pregunta, así que el botón confundiría.
+    if chat_id is not None and not EV_BACKUP_PASSWORD and chat_id in _passwords_recordadas:
+        t.add(_boton_inline("🔒 Olvidar contraseña", "mo_olvidar", ESTILO_PELIGRO))
     t.add(InlineKeyboardButton("❌ Cerrar", callback_data="gm_close"))
     return t
 
@@ -2463,7 +2608,8 @@ def mas_opciones_inicio(message):
 
 
 def mostrar_menu_mas_opciones(message, password):
-    bot.send_message(message.chat.id, "⚙️ ¿Qué quieres hacer?", reply_markup=teclado_mas_opciones())
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "⚙️ ¿Qué quieres hacer?", reply_markup=teclado_mas_opciones(chat_id))
 
 
 def mostrar_resumen(chat_id, app_data):
@@ -2475,16 +2621,11 @@ def mostrar_resumen(chat_id, app_data):
     total_coste_ev = sum(l.get("cost", 0) for l in logs)
 
     ice_liters = settings.get("iceLiters", 0) or 0
-    # Usamos el precio real y actual del gasóleo (API oficial, por provincia si está configurada
+    # Usamos el precio real y actual del carburante (API oficial, por provincia si está configurada
     # en ⚙️ Configuración) para no depender de que el usuario lo busque y lo actualice a mano;
-    # si falla, caemos al valor configurado.
-    precio_gasoil_live, _, fuente_gasoil = _obtener_precio_gasoil_actual(settings.get("provincia"))
-    ice_price = precio_gasoil_live if precio_gasoil_live is not None else (settings.get("icePrice", 0) or 0)
-    nota_precio_gasoil = (
-        f"⛽ Gasóleo: {ice_price} €/L\n_({fuente_gasoil})_"
-        if precio_gasoil_live is not None else
-        f"⛽ Gasóleo: {ice_price} €/L\n_(valor configurado a mano)_"
-    )
+    # si falla, o si lo ha puesto a mano a propósito, caemos al valor configurado.
+    ice_price, fuente_carburante = _precio_carburante_efectivo(settings)
+    nota_precio_gasoil = f"⛽ {_nombre_carburante(settings)}: {ice_price} €/L\n_({fuente_carburante})_"
     coste_ice_equivalente = sum(
         l.get("iceCost") if l.get("iceCost") else (l.get("km", 0) / 100) * ice_liters * ice_price
         for l in logs
@@ -2529,20 +2670,19 @@ def mostrar_resumen(chat_id, app_data):
 
 
 def _texto_ahorro_carga(app_data, coste_ev, km):
-    """Ahorro de UNA carga concreta frente al mismo coche pero de gasolina, usando el consumo
-    (L/100km) configurado y el precio real y actual del gasóleo (por provincia si está
+    """Ahorro de UNA carga concreta frente al coche de referencia de combustión, usando el consumo
+    (L/100km) configurado y el precio real y actual del carburante (por provincia si está
     configurada), igual criterio que el resumen global. Devuelve '' si no hay km para comparar."""
     if not km:
         return ""
     settings = app_data.get("settings", {})
     ice_liters = settings.get("iceLiters", 0) or 0
-    precio_gasoil_live, _, fuente_gasoil = _obtener_precio_gasoil_actual(settings.get("provincia"))
-    ice_price = precio_gasoil_live if precio_gasoil_live is not None else (settings.get("icePrice", 0) or 0)
+    ice_price, _ = _precio_carburante_efectivo(settings)
     coste_ice = (km / 100) * ice_liters * ice_price
     ahorro = coste_ice - coste_ev
     return (
         f"\n\n💚 *Ahorro de esta carga: ~{round(ahorro, 2)} €*\n"
-        f"En gasolina, esos {km} km\n"
+        f"Con {_nombre_carburante(settings)}, esos {km} km\n"
         f"habrían costado ~{round(coste_ice, 2)} €."
     )
 
@@ -2571,8 +2711,8 @@ def mostrar_estadisticas_avanzadas(chat_id, app_data):
         return
 
     ice_liters = settings.get("iceLiters", 0) or 0
-    precio_gasoil_live, _, fuente_gasoil = _obtener_precio_gasoil_actual(settings.get("provincia"))
-    ice_price = precio_gasoil_live if precio_gasoil_live is not None else (settings.get("icePrice", 0) or 0)
+    ice_price, fuente_carburante = _precio_carburante_efectivo(settings)
+    nombre_carburante = _nombre_carburante(settings)
 
     # --- Uso y coste por año, con mix casa/calle ---
     por_anio = _resumen_logs_por_anio(logs)
@@ -2598,9 +2738,9 @@ def mostrar_estadisticas_avanzadas(chat_id, app_data):
         lineas_extra.append(f"⚡ Eléctrico: {round(coste_100km_ev, 2)} €")
     else:
         lineas_extra.append("⚡ Eléctrico: aún sin km suficientes")
-    lineas_extra.append(f"⛽ Diésel: {round(coste_100km_diesel, 2)} €")
+    lineas_extra.append(f"⛽ {nombre_carburante}: {round(coste_100km_diesel, 2)} €")
     lineas_extra.append(f"_{ice_price} €/L_")
-    lineas_extra.append(f"_{fuente_gasoil}_")
+    lineas_extra.append(f"_{fuente_carburante}_")
 
     # --- Zona dulce de carga (20-80%) ---
     con_ambos = [l for l in logs if l.get("socStart") is not None and l.get("socEnd") is not None]
@@ -2646,10 +2786,16 @@ def mostrar_configuracion(chat_id, app_data):
     con un botón por campo repitiendo las mismas etiquetas, lo que obligaba a hacer el doble de
     scroll en el móvil para ver lo mismo dos veces. Ahora el valor actual va dentro del botón."""
     settings = app_data.get("settings", {})
+    auto_precio = settings.get("icePriceAuto") is not False
     t = InlineKeyboardMarkup()
-    for clave, (etiqueta, _tipo, unidad) in CONFIG_CAMPOS.items():
+    for clave, (etiqueta, tipo, unidad) in CONFIG_CAMPOS.items():
         valor = settings.get(clave)
-        if valor in (None, ""):
+        if tipo == "choice":
+            # Se guarda una clave interna ("gasolina95"), pero al usuario hay que enseñarle
+            # el nombre de verdad ("Gasolina 95").
+            opciones = CONFIG_OPCIONES.get(clave, {})
+            texto_valor = opciones.get(valor) or opciones.get(CARBURANTE_POR_DEFECTO, "— sin definir")
+        elif valor in (None, ""):
             texto_valor = "— sin definir"
         else:
             # Un valor de texto largo (p.ej. el modelo del coche) desbordaría el botón y
@@ -2658,7 +2804,12 @@ def mostrar_configuracion(chat_id, app_data):
             if len(texto_valor) > 16:
                 texto_valor = texto_valor[:15] + "…"
             texto_valor = f"{texto_valor}{unidad}"
+        # El precio del litro se consulta solo a la API oficial, así que hay que dejar claro
+        # si el número que se ve manda o si es solo el último valor guardado.
+        if clave == "icePrice":
+            texto_valor += " (auto)" if auto_precio else " (a mano)"
         t.add(InlineKeyboardButton(f"{etiqueta}: {texto_valor}", callback_data=f"cfg|{clave}"))
+    t.add(InlineKeyboardButton("🚘 Cargar datos de un modelo", callback_data="mo_modelos"))
     t.add(InlineKeyboardButton("⬅️ Volver", callback_data="mo_back"))
     bot.send_message(
         chat_id,
@@ -2673,15 +2824,30 @@ def _iniciar_edicion_config(chat_id, clave, password):
         bot.send_message(chat_id, "⚠️ Campo no reconocido.")
         return
     etiqueta, tipo = CONFIG_CAMPOS[clave][0], CONFIG_CAMPOS[clave][1]
+    _set_password_sesion(chat_id, password)
+    if tipo == "choice":
+        # Un campo con dos valores posibles no se escribe a mano: se pulsa. Escribirlo solo
+        # daría ocasión de escribirlo mal.
+        t = InlineKeyboardMarkup()
+        for valor, nombre in CONFIG_OPCIONES.get(clave, {}).items():
+            t.add(InlineKeyboardButton(nombre, callback_data=f"cfgset|{clave}|{valor}"))
+        t.add(InlineKeyboardButton("⬅️ Volver", callback_data="mo_config"))
+        bot.send_message(chat_id, f"✏️ *{etiqueta}*\n\nElige una opción 👇", parse_mode="Markdown", reply_markup=t)
+        return
     datos.setdefault(chat_id, {})["editConfig"] = clave
     datos[chat_id]["editConfigTipo"] = tipo
-    _set_password_sesion(chat_id, password)
+    aviso = ""
+    if clave == "icePrice":
+        aviso = (
+            "\n\n⚠️ Si lo pones a mano dejaré de actualizarlo solo desde la API oficial.\n"
+            "Para volver al automático usa '⛽ Actualizar precio del litro' en Más opciones."
+        )
     ejemplo = "Madrid" if tipo == "text" else "0.22"
     msg = bot.send_message(
         chat_id,
-        f"✏️ *{etiqueta}*\n\nEscribe el nuevo valor.\nEjemplo: {ejemplo}",
+        f"✏️ *{etiqueta}*\n\nEscribe el nuevo valor.\nEjemplo: {ejemplo}{aviso}",
         parse_mode="Markdown",
-        reply_markup=teclado_cancelar(),
+        reply_markup=teclado_cancelar(f"Ejemplo: {ejemplo}"),
     )
     bot.register_next_step_handler(msg, recibir_valor_config)
 
@@ -2723,6 +2889,10 @@ def recibir_valor_config(message):
         datos.pop(chat_id, None)
         return
     app_data.setdefault("settings", {})[clave] = valor_final
+    # Poner el precio del litro a mano significa "no me lo toques": deja de sobrescribirse con
+    # el de la API hasta que el usuario pulse "Actualizar gasóleo".
+    if clave == "icePrice":
+        app_data["settings"]["icePriceAuto"] = False
     try:
         guardar_datos(app_data, password)
     except Exception:
@@ -2867,7 +3037,7 @@ def manejar_callback_gestion(call):
 
     # Cualquier pulsación de botón cuenta como actividad: refresca la marca de tiempo de la
     # sesión para que el purgador de sesiones abandonadas no la borre mientras el usuario
-    # sigue interactuando (p.ej. navegando el calendario del selector de fecha/hora).
+    # sigue interactuando (p.ej. navegando los menús de campos avanzados).
     estado_sesion = datos.get(chat_id)
     if estado_sesion is not None and "password" in estado_sesion:
         estado_sesion["_ts"] = datetime.datetime.now()
@@ -2900,9 +3070,6 @@ def manejar_callback_gestion(call):
     if data == "CL_FECHA_FIN":
         nueva = datos.get(chat_id, {}).get("nuevaCarga", {})
         iniciar_selector_fecha_hora(chat_id, "S_FIN_EDIT", nueva.get("fechaFin"))
-        return
-    if data.startswith("dtp|"):
-        _manejar_callback_selector_fecha(call)
         return
     if data == "CO_OK":
         _guardar_obd_confirmado(chat_id)
@@ -2954,7 +3121,9 @@ def manejar_callback_gestion(call):
             bot.send_message(chat_id, "⚠️ No se pudo importar el backup.")
         return
 
-    password = datos.get(chat_id, {}).get("password") or EV_BACKUP_PASSWORD
+    # Si la sesión se purgó pero la contraseña sigue recordada, se recupera sola en vez de
+    # obligar al usuario a volver al menú y empezar de cero.
+    password = datos.get(chat_id, {}).get("password") or _password_recordada(chat_id)
     if not password:
         bot.send_message(chat_id, "⚠️ Tu sesión ha caducado. Vuelve a pulsar '🗂️ Editar / Borrar registros' o '⚙️ Más opciones'.")
         return
@@ -2962,7 +3131,7 @@ def manejar_callback_gestion(call):
     try:
         app_data, _ = cargar_datos(password)
     except CryptoJSError:
-        _registrar_intento_fallido(chat_id)
+        _olvidar_password(chat_id)
         bot.send_message(chat_id, "❌ La contraseña ya no es válida. Vuelve a intentarlo desde el menú.")
         datos.pop(chat_id, None)
         return
@@ -2976,7 +3145,13 @@ def manejar_callback_gestion(call):
     if data == "gm_back":
         bot.send_message(chat_id, "🗂️ ¿Qué quieres gestionar?", reply_markup=teclado_gestion_root())
     elif data == "mo_back":
-        bot.send_message(chat_id, "⚙️ ¿Qué quieres hacer?", reply_markup=teclado_mas_opciones())
+        bot.send_message(chat_id, "⚙️ ¿Qué quieres hacer?", reply_markup=teclado_mas_opciones(chat_id))
+    elif data == "mo_olvidar":
+        _olvidar_password(chat_id)
+        datos.pop(chat_id, None)
+        bot.send_message(chat_id, "🔒 Contraseña olvidada. Te la volveré a pedir en la próxima acción.")
+        mostrar_menu(chat_id)
+        return
     elif data == "mo_resumen":
         mostrar_resumen(chat_id, app_data)
     elif data == "mo_stats":
@@ -3002,14 +3177,19 @@ def manejar_callback_gestion(call):
             logger.exception("Error guardando preset de tarifa")
             bot.send_message(chat_id, "⚠️ No se pudo guardar la tarifa.")
     elif data == "mo_gasoil":
-        provincia_settings = app_data.get("settings", {}).get("provincia")
-        precio, es_nuevo, fuente_gasoil = _obtener_precio_gasoil_actual(provincia_settings)
+        settings = app_data.setdefault("settings", {})
+        provincia_settings = settings.get("provincia")
+        nombre_carburante = _nombre_carburante(settings)
+        precio, es_nuevo, fuente_carburante = _obtener_precio_carburante(provincia_settings, _tipo_carburante(settings))
         if precio is None:
             aviso_provincia = f" en la provincia '{provincia_settings}'" if provincia_settings else ""
-            bot.send_message(chat_id, f"⚠️ No he podido consultar el precio del gasóleo{aviso_provincia} ahora mismo. Inténtalo más tarde.")
+            bot.send_message(chat_id, f"⚠️ No he podido consultar el precio de {nombre_carburante}{aviso_provincia} ahora mismo. Inténtalo más tarde.")
         else:
-            anterior = app_data.get("settings", {}).get("icePrice")
-            app_data.setdefault("settings", {})["icePrice"] = precio
+            anterior = settings.get("icePrice")
+            settings["icePrice"] = precio
+            # Actualizar a mano vuelve a poner el precio en automático: si el usuario pide
+            # expresamente el precio real, es que quiere el real, no el suyo congelado.
+            settings["icePriceAuto"] = True
             try:
                 guardar_datos(app_data, password)
                 origen = "consultado ahora" if es_nuevo else "de la última consulta (caché de unas horas)"
@@ -3020,14 +3200,65 @@ def manejar_callback_gestion(call):
                 )
                 bot.send_message(
                     chat_id,
-                    f"⛽ Precio del gasóleo A actualizado a {precio}€/L ({fuente_gasoil}, {origen}).\n\n"
+                    f"⛽ Precio de {nombre_carburante} actualizado a {precio}€/L ({fuente_carburante}, {origen}).\n\n"
                     f"Valor anterior: {anterior}€/L." + consejo,
                 )
             except Exception:
-                logger.exception("Error guardando el precio del gasóleo")
+                logger.exception("Error guardando el precio del carburante")
                 bot.send_message(chat_id, "⚠️ No se pudo guardar el nuevo precio.")
     elif data.startswith("cfg|"):
         _iniciar_edicion_config(chat_id, data.split("|", 1)[1], password)
+    elif data.startswith("cfgset|"):
+        _, clave, valor = data.split("|", 2)
+        if clave not in CONFIG_OPCIONES or valor not in CONFIG_OPCIONES[clave]:
+            bot.send_message(chat_id, "⚠️ Opción no reconocida.")
+            return
+        settings = app_data.setdefault("settings", {})
+        settings[clave] = valor
+        if clave == "iceFuel":
+            # Cambiar de combustible deja obsoleto el precio guardado del anterior, así que se
+            # vuelve al automático para que se recalcule con el nuevo.
+            settings["icePriceAuto"] = True
+        try:
+            guardar_datos(app_data, password)
+            bot.send_message(chat_id, f"✅ {CONFIG_CAMPOS[clave][0]}: {CONFIG_OPCIONES[clave][valor]}")
+            mostrar_configuracion(chat_id, app_data)
+        except Exception:
+            logger.exception("Error guardando opción de configuración")
+            bot.send_message(chat_id, "⚠️ No se pudo guardar el cambio.")
+    elif data == "mo_modelos":
+        bot.send_message(
+            chat_id,
+            "🚘 *Modelos con datos ya rellenados*\n\n"
+            "Sobrescribiré capacidad, autonomía y datos del coche de referencia.\n"
+            "El resto (tarifas, cargador, precios de compra) no se toca.",
+            parse_mode="Markdown",
+            reply_markup=teclado_modelos(),
+        )
+    elif data.startswith("mdl|"):
+        ficha = MODELOS_CONOCIDOS.get(data.split("|", 1)[1])
+        if not ficha:
+            bot.send_message(chat_id, "⚠️ Modelo no reconocido.")
+            return
+        settings = app_data.setdefault("settings", {})
+        settings.update(ficha["settings"])
+        settings["icePriceAuto"] = True
+        try:
+            guardar_datos(app_data, password)
+        except Exception:
+            logger.exception("Error aplicando ficha de modelo")
+            bot.send_message(chat_id, "⚠️ No se pudieron guardar los datos del modelo.")
+            return
+        resumen = "\n".join(
+            f"• {CONFIG_CAMPOS[k][0]}: {CONFIG_OPCIONES[k][v] if k in CONFIG_OPCIONES else v}{CONFIG_CAMPOS[k][2]}"
+            for k, v in ficha["settings"].items() if k in CONFIG_CAMPOS
+        )
+        bot.send_message(
+            chat_id,
+            f"✅ *{ficha['nombre']}* aplicado.\n\n{resumen}\n\n{ficha['nota']}",
+            parse_mode="Markdown",
+        )
+        mostrar_configuracion(chat_id, app_data)
     elif data == "gm_logs":
         _listar_logs_inline(chat_id, app_data)
     elif data == "gm_obd":
