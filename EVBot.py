@@ -3145,6 +3145,18 @@ def _odometro_actual(app_data):
     return max(valores[-1][1], max(v for _, v in valores))
 
 
+def _normalizar_concepto_gasto(concepto):
+    """Para agrupar los avisos de vencimiento: dos gastos del mismo tipo que solo
+    difieren en el año escrito en el concepto ("ITV" vs "ITV 2026"), en tildes o
+    en mayúsculas/espacios deben verse como EL MISMO recordatorio. Si no, cada
+    renovación con un texto ligeramente distinto generaría un aviso duplicado
+    además del correcto (uno "vivo" con la fecha nueva y otro "fantasma" con la
+    vieja, ya superada, que nunca deja de avisar)."""
+    texto = _normalizar_texto(concepto).lower()
+    texto = re.sub(r"\d+", "", texto)
+    return re.sub(r"\s+", " ", texto).strip()
+
+
 @bot.message_handler(commands=["anotargasto"])
 @bot.message_handler(func=lambda m: m.text == BTN_GASTO_ANOTAR)
 def anotar_gasto_inicio(message):
@@ -3210,8 +3222,10 @@ def recibir_importe_gasto(message):
     datos[chat_id]["nuevoGasto"]["_odoSugerido"] = sugerido
     msg = bot.send_message(
         chat_id,
-        f"🚗 ¿Con cuántos km se hizo?\n\nEscribe `-` para usar los últimos que conozco: {sugerido} km.",
-        reply_markup=teclado_cancelar(f"km, o - para {sugerido}"), parse_mode="Markdown")
+        f"🚗 ¿Con cuántos km se hizo? (el odómetro)\n\n"
+        f"Ejemplo: 41500 (el último que conozco es {sugerido} km).\n"
+        "Si es un gasto antiguo y no lo sabes, escribe `-` y lo dejamos vacío.",
+        reply_markup=teclado_cancelar("km, o - si no lo sabes"), parse_mode="Markdown")
     bot.register_next_step_handler(msg, recibir_odo_gasto)
 
 
@@ -3221,12 +3235,12 @@ def recibir_odo_gasto(message):
     chat_id = message.chat.id
     texto = message.text.replace(",", ".").strip()
     nuevo = datos[chat_id]["nuevoGasto"]
-    if texto == "-":
-        nuevo["odo"] = nuevo.get("_odoSugerido", 0)
+    if texto == "-" or _normalizar_texto(texto).lower() in RESPUESTAS_SIN_FECHA:
+        nuevo.pop("odo", None)
     elif _es_numero(texto):
         nuevo["odo"] = float(texto)
     else:
-        msg = bot.send_message(chat_id, "🙈 Escribe el número de km, o `-` para usar el último conocido.",
+        msg = bot.send_message(chat_id, "🙈 Escribe el número de km, o `-` si no lo sabes.",
                                reply_markup=teclado_cancelar(), parse_mode="Markdown")
         bot.register_next_step_handler(msg, recibir_odo_gasto)
         return
@@ -3272,7 +3286,7 @@ def mostrar_confirmacion_gasto(chat_id):
         f"🏷️ Tipo: {TIPOS_GASTO.get(tipo, 'Otros')}\n"
         f"✍️ Concepto: {nuevo.get('concepto') or '—'}\n"
         f"💶 Importe: {round(_num(nuevo.get('cost')), 2)} €\n"
-        f"🚗 Odómetro: {round(_num(nuevo.get('odo')))} km\n"
+        f"🚗 Odómetro: {round(_num(nuevo['odo'])) if nuevo.get('odo') is not None else 'sin dato'} km\n"
         f"🔔 Avisar: {' y '.join(aviso) if aviso else 'no'}\n\n"
         "¿Guardo este gasto?")
     t = InlineKeyboardMarkup()
@@ -3309,11 +3323,14 @@ def _guardar_gasto_confirmado(chat_id):
         "tipo": tipo if tipo in TIPOS_GASTO else "otro",
         "concepto": (nuevo.get("concepto") or "")[:LIMITE_TEXTO_GASTO],
         "cost": _num(nuevo.get("cost")),
-        "odo": _num(nuevo.get("odo")),
         "recordarMeses": int(_num(nuevo.get("recordarMeses"))),
         "recordarKm": int(_num(nuevo.get("recordarKm"))),
         "notas": "",
     }
+    # Sin odómetro conocido (gasto antiguo, recibo sin apuntarlo...): se deja sin
+    # guardar en vez de forzar un 0, que se confundiría con "0 km" en las gráficas.
+    if nuevo.get("odo") is not None:
+        entrada["odo"] = _num(nuevo.get("odo"))
     app_data.setdefault("gastos", []).append(entrada)
 
     try:
@@ -3364,14 +3381,17 @@ def _vencimientos(app_data, odo_actual=0, ahora=None):
     """Qué mantenimiento toca, a partir de los gastos con recordatorio.
 
     Solo cuenta el ÚLTIMO gasto de cada tipo+concepto: si ya has pasado la ITV
-    de este año, la del año pasado no debe seguir avisando. Traducción de
+    de este año, la del año pasado no debe seguir avisando. El concepto se
+    normaliza (sin tildes/mayúsculas/años) para que "ITV" e "ITV 2026" cuenten
+    como el mismo aviso: si no, cada renovación anual con un año distinto en el
+    texto generaría un aviso duplicado además del correcto. Traducción de
     `vencimientos()` en shared/model.js."""
     ahora = ahora or datetime.datetime.now()
     ultimos = {}
     for g in app_data.get("gastos") or []:
         if not g.get("recordarMeses") and not g.get("recordarKm"):
             continue
-        clave = f"{g.get('tipo')}|{(g.get('concepto') or '').lower()}"
+        clave = f"{g.get('tipo')}|{_normalizar_concepto_gasto(g.get('concepto'))}"
         previo = ultimos.get(clave)
         if previo is None or str(g.get("date") or "") > str(previo.get("date") or ""):
             ultimos[clave] = g
